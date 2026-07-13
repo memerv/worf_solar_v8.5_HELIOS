@@ -130,6 +130,47 @@ _NUMERIC_FIELDS = [
     "claimed_saving_year", "claimed_payback_years", "price_per_wp",
 ]
 
+# คอลัมน์ข้อความที่ต้องล้าง whitespace + ตัดค่า placeholder ("-", "N/A" ฯลฯ) ออก
+# ไม่งั้นค่าพวกนี้จะโผล่เป็น "แบรนด์" ปลอมในตัวกรอง/ตารางแสดงผล
+_TEXT_FIELDS = ["vendor", "phase", "type", "panel_brand", "panel_model",
+               "inverter_brand", "inverter_model", "battery_brand", "battery_model",
+               "service_area", "notes"]
+
+# คอลัมน์ "แบรนด์" ที่ต้องรวมตัวสะกดซ้ำแบบต่างเคส (เช่น 'HUAWEI' vs 'Huawei' ในไฟล์จริง
+# ของ PEA เป็นแบรนด์เดียวกันแต่พิมพ์ไม่ตรงกัน) — เลือกตัวสะกดที่พบบ่อยสุดเป็นค่ามาตรฐาน
+_BRAND_LIKE_FIELDS = ["vendor", "phase", "panel_brand", "inverter_brand", "battery_brand"]
+
+_PLACEHOLDER_TOKENS = {"-", "", "nan", "none", "n/a", "na", "null", "unknown", "-\xa0"}
+
+
+def _clean_text_col(s: pd.Series) -> pd.Series:
+    """ล้างข้อความ: ตัดอักขระซ่อน/ช่องว่างเกิน + แปลงค่า placeholder ('-','N/A',...) เป็นค่าว่างจริง
+    (แก้บั๊ก: เดิม '-' ที่ใช้แทน 'ไม่มีข้อมูล' ในไฟล์ต้นทาง ถูกอ่านเป็นชื่อแบรนด์จริงๆ)
+    """
+    def _one(v):
+        if pd.isna(v):
+            return None
+        t = str(v)
+        for ch in _INVISIBLE_CHARS:
+            t = t.replace(ch, "")
+        t = " ".join(t.strip().split())
+        return None if t.lower() in _PLACEHOLDER_TOKENS else t
+    return s.map(_one)
+
+
+def _canonicalize_brand_case(s: pd.Series) -> pd.Series:
+    """รวมชื่อแบรนด์ที่สะกดต่างเคสกัน (HUAWEI/Huawei) ให้เป็นค่าเดียว
+    เลือกตัวสะกดที่พบบ่อยที่สุดในไฟล์เป็นตัวแทน เพื่อไม่ให้แบรนด์เดียวกันขึ้นซ้ำ 2 ชื่อ
+    ในตัวกรอง/ตารางแสดงผล
+    """
+    non_null = s.dropna()
+    if not len(non_null):
+        return s
+    canon = (non_null.groupby(non_null.str.lower())
+             .apply(lambda g: g.value_counts().idxmax()))
+    canon_map = canon.to_dict()
+    return s.map(lambda v: canon_map.get(v.lower(), v) if isinstance(v, str) else v)
+
 
 def parse_package_catalog(file) -> pd.DataFrame:
     """อ่านไฟล์ Excel catalog แล้วคืน DataFrame ชื่อคอลัมน์มาตรฐาน"""
@@ -178,6 +219,16 @@ def parse_package_catalog(file) -> pd.DataFrame:
                 .replace({"-": None, "": None, "nan": None})
             )
             out[f] = pd.to_numeric(out[f], errors="coerce")
+
+    # ล้างข้อความ: ตัดช่องว่าง/อักขระซ่อน + แปลง '-'/'N/A' เป็นค่าว่างจริง (แก้บั๊กแบรนด์ปลอม)
+    for f in _TEXT_FIELDS:
+        if f in out.columns:
+            out[f] = _clean_text_col(out[f])
+
+    # รวมแบรนด์ที่สะกดต่างเคสกัน (เช่น HUAWEI/Huawei) ให้เหลือชื่อเดียว
+    for f in _BRAND_LIKE_FIELDS:
+        if f in out.columns:
+            out[f] = _canonicalize_brand_case(out[f])
 
     # ตัดแถวว่าง (ไม่มีทั้ง pack_id และ package_code)
     key_cols = [c for c in ("pack_id", "package_code") if c in out.columns]
