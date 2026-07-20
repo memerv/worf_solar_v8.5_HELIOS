@@ -62,6 +62,55 @@ def day_night_monthly_summary(interval_df: pd.DataFrame,
     return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
 
 
+def monthly_total_kwh(interval_df: pd.DataFrame) -> pd.DataFrame:
+    """พลังงานรวมต่อเดือน (kWh) จากข้อมูลรายช่วง = ผลรวม(kW x dt) ต่อเดือน
+    ใช้หาว่าเดือนไหน 'ใช้ไฟมากสุด/น้อยสุด' เพื่อเอาโปรไฟล์ 2 เดือนนั้นมาโชว์
+    """
+    df = interval_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.dropna(subset=["timestamp", "load_kw"]).sort_values("timestamp")
+    if len(df) < 2:
+        return pd.DataFrame()
+    deltas = df["timestamp"].diff().dropna().dt.total_seconds() / 3600.0
+    dt = float(deltas[deltas > 0].mode().iloc[0]) if (deltas > 0).any() else 0.25
+    df["month"] = df["timestamp"].dt.to_period("M")
+    df["kwh"] = df["load_kw"] * dt
+    out = (df.groupby("month")
+             .agg(total_kwh=("kwh", "sum"),
+                  n_days=("timestamp", lambda s: s.dt.date.nunique()))
+             .reset_index())
+    out["month_label"] = out["month"].map(thai_month_label)
+    return out
+
+
+def hourly_avg_profile(interval_df: pd.DataFrame, period) -> pd.DataFrame:
+    """โปรไฟล์โหลดเฉลี่ยรายชั่วโมง (24 จุด) ของเดือนที่ระบุ
+    คืน DataFrame: hour (0-23), load_kw (ค่าเฉลี่ยของทุกวันในเดือนนั้น ณ ชั่วโมงนั้น)
+    """
+    df = interval_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.dropna(subset=["timestamp", "load_kw"])
+    df = df[df["timestamp"].dt.to_period("M") == period]
+    if not len(df):
+        return pd.DataFrame({"hour": list(range(24)), "load_kw": [float("nan")] * 24})
+    df["hour"] = df["timestamp"].dt.hour
+    prof = df.groupby("hour")["load_kw"].mean().reindex(range(24))
+    return pd.DataFrame({"hour": prof.index, "load_kw": prof.values})
+
+
+def solar_hourly_profile(kwp: float, specific_yield: float = 4.0) -> list:
+    """โปรไฟล์ PV เฉลี่ยรายชั่วโมง (24 จุด, kW) ของระบบขนาด kwp
+    สเกลรูประฆังกลางวัน (06:00-18:00) ให้พลังงานรวมทั้งวัน = kwp x specific_yield (kWh/วัน)
+    """
+    hours = np.arange(24, dtype=float)
+    bell = np.clip(np.sin(np.pi * (hours - 6) / 12.0), 0, None)
+    bell = np.where((hours >= 6) & (hours <= 18), bell, 0.0)
+    integral = bell.sum()
+    daily_target = float(kwp) * float(specific_yield)
+    scale = daily_target / integral if integral > 0 else 0.0
+    return (bell * scale).tolist()
+
+
 def linear_trend(y) -> list | None:
     """คืนค่าตามเส้นแนวโน้มเชิงเส้น (least squares) ของชุดข้อมูล y
     ใช้วาด 'เส้นประแนวโน้ม' แบบ Linear ในกราฟของทีม — ต้องมีจุดจริง >= 2 จุด
@@ -91,6 +140,87 @@ def demand_peak_monthly(interval_df: pd.DataFrame, tariff=None) -> pd.DataFrame:
              .reset_index())
     out["month_label"] = out["month"].map(thai_month_label)
     return out
+
+
+# ---------------------------------------------------------------------------
+# โปรไฟล์รายชั่วโมงเฉลี่ยต่อเดือน + เลือกเดือนใช้ไฟมากสุด/น้อยสุด
+# (สำหรับกราฟเทียบโหลดจริง vs โซลาร์ 3 ขนาด)
+# ---------------------------------------------------------------------------
+
+def monthly_energy_ranking(interval_df: pd.DataFrame) -> pd.DataFrame:
+    """สรุปพลังงานรวม (kWh) ต่อเดือน เรียงไว้ให้เลือกเดือนมากสุด/น้อยสุด
+    ตัดเดือนที่ข้อมูลไม่ครบ (จุดน้อยผิดปกติ) ออก เพื่อไม่ให้เดือนข้อมูลพังถูกเลือกมาโชว์
+    """
+    df = interval_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.dropna(subset=["timestamp", "load_kw"])
+    if not len(df):
+        return pd.DataFrame()
+    dt = _infer_dt(df)
+    df["month"] = df["timestamp"].dt.to_period("M")
+    g = df.groupby("month")
+    out = g.agg(n_points=("load_kw", "size"),
+                avg_kw=("load_kw", "mean"),
+                energy_kwh=("load_kw", lambda s: float(s.sum()) * dt)).reset_index()
+    # เดือนที่ "ครบพอ" = มีจุดอย่างน้อย 60% ของค่ามัธยฐานจุดต่อเดือน
+    med = out["n_points"].median()
+    out["is_full"] = out["n_points"] >= 0.6 * med
+    out["month_label"] = out["month"].map(thai_month_label)
+    return out.sort_values("energy_kwh").reset_index(drop=True)
+
+
+def pv_hourly_profile(kwp: float, specific_yield: float = 4.0) -> "np.ndarray":
+    """โปรไฟล์กำลังผลิตโซลาร์เฉลี่ยราย 'ชั่วโมงของวัน' (0-23) สำหรับระบบขนาด kwp
+    รูประฆังกลางวัน (6-18น.) สเกลให้พลังงานรวมทั้งวัน = kwp * specific_yield (kWh/วัน)
+    ใช้เทียบกับ hourly_avg_profile บนแกนเวลาเดียวกัน
+    """
+    hours = np.arange(24, dtype=float)
+    bell = np.clip(np.sin(np.pi * (hours - 6) / 12.0), 0, None)
+    bell = np.where((hours >= 6) & (hours <= 18), bell, 0.0)
+    integral = bell.sum()  # dt = 1 ชม. ต่อจุด
+    daily_kwh = float(kwp) * float(specific_yield)
+    scale = daily_kwh / integral if integral > 0 else 0.0
+    return bell * scale
+
+
+def three_solar_sizes(catalog: pd.DataFrame, target_wp: float) -> dict:
+    """เลือกกำลังแผง 3 ขนาดจาก catalog จริงสำหรับเส้นเทียบ:
+    min (เล็กสุดที่มีขาย) · mid (กลางๆ ระหว่าง min กับ target) · near (ใกล้ target ที่สุด)
+    คืน dict {label: kwp} — ใช้ค่าที่ 'มีจริงในสต็อก' ไม่ใช่ตัวเลขลอยๆ
+    """
+    if "panel_total_wp" not in catalog.columns:
+        return {}
+    wp = catalog["panel_total_wp"].dropna()
+    wp = wp[wp > 0]
+    if not len(wp):
+        return {}
+    sizes = sorted(wp.unique())
+    kwp_list = [s / 1000.0 for s in sizes]
+    tgt = (target_wp or 0) / 1000.0
+
+    smin = kwp_list[0]
+    # near = ค่าที่ใกล้ target ที่สุด (ถ้าไม่มี target ใช้ตัวใหญ่สุด)
+    near = min(kwp_list, key=lambda k: abs(k - tgt)) if tgt > 0 else kwp_list[-1]
+    # mid = ค่าที่ใกล้กึ่งกลางระหว่าง smin กับ near
+    mid_target = (smin + near) / 2.0
+    mid = min(kwp_list, key=lambda k: abs(k - mid_target))
+
+    out = {}
+    if smin > 0:
+        out["min"] = round(smin, 2)
+    if mid not in out.values():
+        out["mid"] = round(mid, 2)
+    if near not in out.values():
+        out["near"] = round(near, 2)
+    return out
+
+
+def _infer_dt(df: pd.DataFrame) -> float:
+    ts = pd.to_datetime(df["timestamp"]).sort_values().reset_index(drop=True)
+    if len(ts) < 2:
+        return 0.25
+    d = (ts.iloc[1] - ts.iloc[0]).total_seconds() / 3600.0
+    return d if d > 0 else 0.25
 
 
 # ---------------------------------------------------------------------------

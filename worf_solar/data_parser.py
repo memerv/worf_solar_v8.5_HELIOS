@@ -350,8 +350,15 @@ def parse_customer_bill(file) -> dict:
             .replace({"-": None, "": None, "nan": None, "None": None}),
             errors="coerce")
 
+    # คำที่บ่งบอกว่าแถวเป็น "ข้อมูลรายช่วง" — ครอบคลุมหลายแบบที่ผู้กรอกใช้จริง:
+    #   'รายช่วง' (เทมเพลตของเรา), '15 นาที'/'นาที', 'รายชั่วโมง'/'ชั่วโมง'
+    # (บั๊กเดิม: จับแค่ 'รายช่วง' ทำให้ไฟล์ที่เขียน '15 นาที' ถูกมองเป็นรายเดือนแล้ว data=None)
+    _INTERVAL_RE = r"รายช่วง|นาที|ชั่วโมง|รายชม|hourly|minute|interval"
+    _MONTHLY_RE = r"รายเดือน|monthly"
+
     if col_rowtype:
-        mask = df[col_rowtype].astype(str).str.contains("รายช่วง|รายเดือน", na=False)
+        mask = df[col_rowtype].astype(str).str.contains(
+            f"{_INTERVAL_RE}|{_MONTHLY_RE}", na=False, regex=True)
         work = df[mask].copy()
     else:
         work = df.copy()
@@ -363,12 +370,28 @@ def parse_customer_bill(file) -> dict:
             vals = vals[~vals.isin(["-", "nan", "None"])]
             meta[key] = vals.iloc[0] if len(vals) else None
 
+    # ตัดสินว่าเป็นรายช่วงไหม: ดูจาก (1) คำในคอลัมน์ประเภท หรือ
+    # (2) fallback — มีคอลัมน์โหลด (kW) + คอลัมน์เวลา และมีหลายแถวต่อวัน = รายช่วงแน่ๆ
     is_interval = False
     if col_rowtype:
-        is_interval = work[col_rowtype].astype(str).str.contains("รายช่วง", na=False).any()
+        is_interval = work[col_rowtype].astype(str).str.contains(
+            _INTERVAL_RE, na=False, regex=True).any()
+    if not is_interval and col_load and col_time:
+        # ไม่มีคำระบุประเภทชัด แต่มีทั้งโหลด(kW)และเวลา -> ถือเป็นรายช่วง
+        n_time_vals = work[col_time].astype(str).replace(
+            {"-": None, "nan": None, "": None}).dropna().nunique()
+        if n_time_vals > 3:   # มีหลายช่วงเวลาต่อวัน = interval ไม่ใช่รายเดือน
+            is_interval = True
 
     if is_interval and col_load:
-        iv = work[work[col_rowtype].astype(str).str.contains("รายช่วง", na=False)].copy()
+        # ถ้ามีคอลัมน์ประเภทและมีคำ interval ให้กรองด้วยคำนั้น
+        # ไม่งั้น (เดาจาก data shape) ใช้ทุกแถวใน work ที่มีค่าโหลด
+        if col_rowtype and work[col_rowtype].astype(str).str.contains(
+                _INTERVAL_RE, na=False, regex=True).any():
+            iv = work[work[col_rowtype].astype(str).str.contains(
+                _INTERVAL_RE, na=False, regex=True)].copy()
+        else:
+            iv = work.copy()
         # แก้ #6: ถ้าหาคอลัมน์วันที่/เวลาไม่เจอ ต้องเตือนผู้ใช้ ไม่ใช่ fallback เงียบๆ
         if not col_date:
             warnings.append("⚠️ หาคอลัมน์ 'วันที่' ไม่เจอ — ใช้วันที่สมมติ (2025-01-01) "
@@ -378,7 +401,16 @@ def parse_customer_bill(file) -> dict:
                             "โปรไฟล์รายชั่วโมงจะไม่ถูกต้อง")
         date_str = iv[col_date].astype(str) if col_date else "2025-01-01"
         time_str = iv[col_time].astype(str) if col_time else "00:00"
-        ts = _to_ce_datetime(date_str + " " + time_str)
+
+        # จัดการเวลา "24:00" (บางไฟล์ใช้แทน 'สิ้นสุดวัน' = เที่ยงคืนของวันถัดไป)
+        # pandas แปลง 24:00 ไม่ได้ -> เดิมถูกตัดทิ้งเงียบๆ วันละ 1 แถว
+        # แก้: ถ้าเจอ 24:00 ให้แปลงเป็น 00:00 แล้วบวกวันให้ 1 วันหลังแปลงเสร็จ
+        time_str = time_str.astype(str).str.strip()
+        is_2400 = time_str.str.match(r"^24:0{1,2}(:0{1,2})?$")
+        time_norm = time_str.where(~is_2400, "00:00")
+        ts = _to_ce_datetime(date_str.astype(str) + " " + time_norm)
+        if is_2400.any():
+            ts = ts + pd.to_timedelta(is_2400.astype(int), unit="D")
         if ts.isna().any():
             n_bad = int(ts.isna().sum())
             warnings.append(f"⚠️ มี {n_bad:,} แถวที่แปลงวันที่/เวลาไม่สำเร็จ ถูกตัดออกจากการคำนวณ")
@@ -398,7 +430,8 @@ def parse_customer_bill(file) -> dict:
 
     mo = work.copy()
     if col_rowtype:
-        mo = work[work[col_rowtype].astype(str).str.contains("รายเดือน", na=False)].copy()
+        mo = work[work[col_rowtype].astype(str).str.contains(
+            _MONTHLY_RE, na=False, regex=True)].copy()
     monthly = pd.DataFrame({
         "month": mo[col_date].astype(str) if col_date else range(len(mo)),
         "kwh": clean_num(mo[col_kwh]) if col_kwh else pd.Series(dtype=float),

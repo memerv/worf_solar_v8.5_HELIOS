@@ -1,9 +1,9 @@
 [theme]
 base = "light"
-# primaryColor คุมสี slider/focus ทั้งแอป — เดิมเป็นม่วงอ่อน #E4D4FB
-# กลืนกับพื้นครีม/เหลืองจนมองแถบสไลด์ไม่เห็น จึงเปลี่ยนเป็นดำ
+# primaryColor คุมสี slider/focus ทั้งแอป — ตั้งเป็นดำเพื่อให้มองแถบสไลด์เห็นชัดบนพื้นม่วงอ่อน
 primaryColor = "#111111"
-backgroundColor = "#FBF8EF"
-secondaryBackgroundColor = "#FBF1CE"
+# ธีมสีม่วงอ่อนตาม PEA (จาก palette #D4BFFB/#8C6EF1) — พื้นหลังม่วงอ่อนมาก อ่านสบายตา
+backgroundColor = "#F3EEFC"
+secondaryBackgroundColor = "#E9DEFB"
 textColor = "#111111"
 font = "sans serif"

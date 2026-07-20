@@ -115,6 +115,110 @@ def _monthly_example_rows():
     return rows
 
 
+def _lead_profile_kw(hour_f: float, month: int, kind: str) -> float:
+    """โปรไฟล์โหลดจำลองตามประเภทกิจการ ใช้สร้างไฟล์ตัวอย่างสำหรับสแกนลูกค้า
+    kind: 'factory_day' (โรงงานกลางวัน) | 'office' (สำนักงาน) | 'night' (กะกลางคืน)
+    """
+    h = hour_f
+    f = _SEASONAL_FACTOR.get(month, 1.0)
+    if kind == "factory_day":
+        # เดินเครื่อง 8-17 น. ทุกวัน โหลดกลางวันสูงและนิ่งมาก -> โซลาร์คุ้มสุด (เกรด A)
+        base = 45.0
+        day = 120.0 if 8 <= h < 17 else 0.0
+        lunch = -12.0 * math.exp(-((h - 12.0) ** 2) / 1.2)
+        kw = base + day + lunch
+    elif kind == "retail":
+        # ร้านค้า/ห้าง: เปิด 10:00-21:00 ทุกวัน -> ใช้ไฟช่วงเย็น-ค่ำเยอะพอควร
+        # ซึ่งโซลาร์ช่วยไม่ได้ (ไม่มีแดด) -> คุ้มปานกลาง (เกรด B)
+        base = 8.0
+        openh = 30.0 if 10 <= h < 21 else 0.0
+        evening = 25.0 * math.exp(-((h - 19.0) ** 2) / 6.0)   # พีคช่วงค่ำ ไม่มีแดด
+        midday = 12.0 * math.exp(-((h - 14.0) ** 2) / 10.0)
+        swing = 6.0 * math.sin(h * 2.1 + month)
+        kw = base + openh + evening + midday + swing
+    else:  # night
+        # กะกลางคืน ใช้ไฟตอนไม่มีแดด -> โซลาร์ช่วยได้น้อย (เกรด C)
+        base = 20.0
+        night = 90.0 if (h >= 19 or h < 6) else 0.0
+        kw = base + night
+    kw *= f
+    kw += 2.0 * math.sin(h * 2.3 + month * 0.7)   # จิตเตอร์เล็กน้อยแบบทำซ้ำได้
+    return max(3.0, round(kw, 2))
+
+
+def _lead_example_rows(kind: str) -> list:
+    """ข้อมูลราย 15 นาที ครบ 12 เดือน (1 วันตัวแทน/เดือน x 96 ช่วง) ของลูกค้า 1 ราย"""
+    rows = []
+    first = True
+    for month in range(1, 13):
+        date_str = f"15/{month:02d}/2568"
+        for q in range(96):
+            h_int, m_int = divmod(q * 15, 60)
+            kw = _lead_profile_kw(h_int + m_int / 60.0, month, kind)
+            biz = {"factory_day": "โรงงานผลิต (8-17น.)", "retail": "ร้านค้า/ห้างสรรพสินค้า",
+                   "night": "โรงงานกะกลางคืน"}[kind]
+            rows.append(["รายช่วง", date_str, f"{h_int:02d}:{m_int:02d}", kw,
+                         round(kw * 0.25, 2), "-",
+                         "Peak" if 9 <= h_int < 22 else "Off-Peak", "-",
+                         "TOU" if first else "-", biz if first else "-",
+                         "ไฟล์ตัวอย่างสำหรับทดสอบสแกนลูกค้า" if first else ""])
+            first = False
+    return rows
+
+
+def build_lead_customer_bytes(kind: str) -> bytes:
+    """สร้างไฟล์ลูกค้า 1 ราย (.xlsx) สำหรับใช้กับโหมดสแกนลูกค้าหลายราย"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "โหลดโปรไฟล์"
+    for j, h in enumerate(HEADERS, start=1):
+        ws.cell(row=1, column=j, value=h)
+    _style_header(ws, 1)
+    for i, r in enumerate(_lead_example_rows(kind), start=2):
+        for j, v in enumerate(r, start=1):
+            c = ws.cell(row=i, column=j, value=v)
+            c.border = _border
+    _autosize(ws, {1: 16, 2: 15, 3: 12, 4: 20, 5: 17, 6: 16, 7: 22, 8: 20,
+                   9: 15, 10: 20, 11: 22})
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_lead_batch_examples() -> bytes:
+    """รวมไฟล์ตัวอย่างลูกค้า 3 ราย (คาดว่าได้เกรดต่างกัน) เป็น .zip ไฟล์เดียว
+    เอาไปลากใส่ช่อง 'สแกนหลายรายพร้อมกัน' ได้ทันทีเพื่อทดสอบ
+    """
+    import zipfile
+    files = {
+        "ลูกค้า_โรงงานกลางวัน (คาดเกรด A).xlsx": "factory_day",
+        "ลูกค้า_ร้านค้า-เปิดถึงค่ำ (คาดเกรด B).xlsx": "retail",
+        "ลูกค้า_โรงงานกะกลางคืน (คาดเกรด C).xlsx": "night",
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for fname, kind in files.items():
+            z.writestr(fname, build_lead_customer_bytes(kind))
+        z.writestr("อ่านก่อน.txt",
+                   "ไฟล์ตัวอย่างสำหรับทดสอบโหมด 'หาลูกค้าเชิงรุก — สแกนหลายรายพร้อมกัน'\r\n"
+                   "\r\n"
+                   "วิธีใช้: แตกไฟล์ zip นี้ แล้วลากไฟล์ .xlsx ทั้ง 3 ไฟล์ใส่ช่องอัปโหลด\r\n"
+                   "ในหัวข้อ 'หาลูกค้าเชิงรุก' พร้อมกันได้เลย\r\n"
+                   "\r\n"
+                   "แต่ละไฟล์ = ลูกค้า 1 ราย (ชื่อไฟล์จะถูกใช้เป็นชื่อลูกค้าในตารางผล)\r\n"
+                   "ข้อมูลเป็นราย 15 นาที ครบ 12 เดือน (1 วันตัวแทน/เดือน)\r\n"
+                   "\r\n"
+                   "ผลที่ควรได้:\r\n"
+                   "  โรงงานกลางวัน   -> เกรดสูงสุด (ใช้ไฟกลางวันเยอะ นิ่ง ปริมาณมาก)\r\n"
+                   "  ร้านค้าเปิดถึงค่ำ -> เกรดกลาง (ใช้ไฟช่วงค่ำเยอะ โซลาร์ช่วยไม่ได้)\r\n"
+                   "  โรงงานกะกลางคืน -> เกรดต่ำสุด (ใช้ไฟตอนไม่มีแดด โซลาร์ช่วยน้อย)\r\n"
+                   "\r\n"
+                   "ถ้าจะใช้กับลูกค้าจริง: ตั้งชื่อไฟล์เป็นชื่อลูกค้า แล้วกรอกข้อมูล\r\n"
+                   "ตามคอลัมน์เดียวกันนี้ (ดูเทมเพลตข้อมูลลูกค้าประกอบ)\r\n")
+    return buf.getvalue()
+
+
 def build_template_bytes() -> bytes:
     wb = Workbook()
 

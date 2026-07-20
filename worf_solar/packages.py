@@ -57,6 +57,53 @@ COLUMN_LABELS_TH = {
 }
 
 
+def generate_sample_catalog() -> pd.DataFrame:
+    """สร้าง catalog ตัวอย่างสำหรับทดสอบ (เมื่อยังไม่มีไฟล์จริง)
+    คอลัมน์ครบตาม schema ที่ customer_view/recommend_packages ต้องใช้
+    ครอบคลุมหลายขนาด (เล็ก-กลาง-ใหญ่) และหลายแบรนด์ เพื่อให้เห็น 3 band ในการแนะนำ
+    """
+    rows = [
+        # (code, vendor, phase, panel_brand, panel_wp, panel_qty, inv_brand, inv_kw,
+        #  batt_brand, batt_model, batt_kwh, price, save_mo, payback, area)
+        ("DEMO-05-05", "DEMO", "3 Phase", "JinKO", 5000, 8, "Huawei", 5,
+         "Huawei", "LUNA2000-5", 5.0, 230000, 3200, 5.9, 30),
+        ("DEMO-10-10", "DEMO", "3 Phase", "JinKO", 10000, 16, "Deye", 10,
+         "Dyness", "Powerbox", 10.24, 420000, 6400, 5.4, 60),
+        ("DEMO-20-15", "DEMO", "3 Phase", "JinKO", 20000, 32, "Huawei", 20,
+         "Huawei", "LUNA2000-15", 15.0, 780000, 12800, 5.1, 120),
+        ("DEMO-30-20", "DEMO", "3 Phase", "Trina", 30000, 48, "Sungrow", 30,
+         "BYD", "HVM", 20.0, 1150000, 19200, 5.0, 180),
+        ("DEMO-50-40", "DEMO", "3 Phase", "Trina", 50000, 80, "Sungrow", 50,
+         "BYD", "HVM", 40.0, 1850000, 32000, 4.8, 300),
+        ("DEMO-05-00", "DEMO", "1 Phase", "JinKO", 5000, 8, "Deye", 5,
+         None, None, 0.0, 175000, 3000, 4.9, 30),
+        ("DEMO-10-00", "DEMO", "3 Phase", "JinKO", 10000, 16, "Deye", 10,
+         None, None, 0.0, 330000, 6000, 4.6, 60),
+        ("DEMO-20-00", "DEMO", "3 Phase", "Trina", 20000, 32, "Sungrow", 20,
+         None, None, 0.0, 620000, 12000, 4.3, 120),
+    ]
+    recs = []
+    for (code, vendor, phase, pbrand, pwp, pqty, ibrand, ikw,
+         bbrand, bmodel, bkwh, price, save_mo, payback, area) in rows:
+        recs.append({
+            "package_code": code, "pack_id": code, "vendor": vendor, "phase": phase,
+            "panel_brand": pbrand, "panel_model": f"{pbrand}-mono",
+            "panel_total_wp": pwp, "panel_qty": pqty,
+            "inverter_brand": ibrand, "inverter_model": f"{ibrand}-{ikw}k",
+            "inverter_total_kw": ikw,
+            "battery_brand": bbrand, "battery_model": bmodel, "battery_total_kwh": bkwh,
+            "catalog_price": price,
+            "warranty_panel_product": 12, "warranty_panel_power": 25,
+            "warranty_inverter": 10, "warranty_battery": 10 if bkwh else None,
+            "warranty_install": 1, "fire_insurance": 1, "maintenance": 1,
+            "install_area_sqm": area,
+            "claimed_saving_month": save_mo, "claimed_saving_year": save_mo * 12,
+            "claimed_payback_years": payback, "service_area": "ทั่วประเทศ (ตัวอย่าง)",
+            "type": "SB" if bkwh else "SO",
+        })
+    return pd.DataFrame(recs)
+
+
 def customer_view(catalog: pd.DataFrame, rename_thai: bool = True) -> pd.DataFrame:
     """คืน DataFrame เฉพาะคอลัมน์ที่ปลอดภัยให้ลูกค้าเห็น (ตัด Pro price/margin ออก)"""
     cols = [c for c in CUSTOMER_SAFE_COLUMNS if c in catalog.columns]
@@ -322,31 +369,107 @@ def recommend_packages(catalog: pd.DataFrame, *, want_battery: bool,
     else:
         target_wp = None
 
-    # ---- แท็ก "แพ็กตัวแทน 3 ระดับ" ให้ลูกค้าเลือกตามความต้องการ ----
-    #   เล็กสุดที่แนะนำ  · ราคากลาง/คุ้มค่าที่สุด · ใกล้เป้าหมายการใช้ไฟ
-    # เลือกจาก 'ผู้สมัครที่ผ่านตัวกรองทั้งหมด' (ไม่ใช่แค่ top-N) แล้วการันตีให้อยู่ในตารางเสมอ
-    tier_rows, tier_labels = _pick_representative_tiers(work, target_wp)
+    # ---- จัดกลุ่มเป็น 3 ระดับขนาด (band) ให้ลูกค้าเลือก ----
+    #   ขั้นต่ำ (เล็กสุด ลงทุนน้อย) · กลาง · ใกล้เป้าหมายการใช้ไฟจริง
+    # แต่ละ band คัด 5-10 แพ็กที่เหมาะสุดในช่วงนั้น (ไม่ใช่แค่ 3 แพ็กตัวแทนเดี่ยว)
+    per_band = max(1, int(max_show) // 3) if max_show else 5
+    per_band = min(10, max(3, per_band))   # 3-10 แพ็กต่อ band
+    top, tier_labels = _band_recommendations(work, target_wp, per_band)
 
-    top = work.head(int(max_show)).copy()
-    # การันตีว่าแพ็กตัวแทนทั้ง 3 อยู่ในตาราง แม้ขนาดจะห่างจากเป้าหมาย
-    for idx in tier_rows.values():
-        if idx is not None and idx not in top.index:
-            top = pd.concat([top, work.loc[[idx]]])
-    top = top.reset_index(drop=True)
-
-    # ใส่คอลัมน์ป้ายคำแนะนำ (tier_label) ให้แถวตัวแทน
-    label_by_code = {}
-    for tier, idx in tier_rows.items():
-        if idx is not None:
-            code = str(work.loc[idx].get("package_code") or work.loc[idx].get("pack_id"))
-            label_by_code[code] = tier_labels[tier]
-    top["tier_label"] = [
-        label_by_code.get(str(r.get("package_code") or r.get("pack_id")), "")
-        for _, r in top.iterrows()
-    ]
+    # ถ้าเป้าหมายใหญ่กว่าแพ็กที่ใหญ่สุดในแคตตาล็อกมาก -> แนะนำติดหลายชุด (เช่น 130+130)
+    if (target_wp and target_wp > 0 and "panel_total_wp" in work.columns
+            and work["panel_total_wp"].notna().any()):
+        max_wp = float(work["panel_total_wp"].max())
+        if target_wp > max_wp * 1.3:  # เกิน 30% ของแพ็กใหญ่สุด
+            import math
+            n_units = max(2, math.ceil(target_wp / max_wp))
+            warnings.append(
+                f"เป้าหมาย {target_wp/1000:.0f} kWp ใหญ่กว่าแพ็กเดี่ยวที่ใหญ่สุด "
+                f"({max_wp/1000:.0f} kWp) — ลูกค้ารายนี้เหมาะกับการติด "
+                f"~{n_units} ชุดขนานกัน (เช่น {max_wp/1000:.0f}×{n_units} ≈ "
+                f"{max_wp*n_units/1000:.0f} kWp) หรือเลือกแพ็กใหญ่สุดแล้วเสริมภายหลัง")
 
     return {"top": top, "dropped": dropped, "warnings": warnings,
-            "target_wp": target_wp, "tiers": tier_labels}
+            "target_wp": target_wp, "tiers": tier_labels,
+            "per_band": per_band}
+
+
+def _band_recommendations(work: pd.DataFrame, target_wp, per_band: int) -> tuple:
+    """แบ่งแพ็กเป็น 3 ระดับขนาด แล้วคัด per_band แพ็กที่เหมาะสุดในแต่ละระดับ
+
+    เกณฑ์แบ่ง band ตามกำลังแผง (Wp):
+      near  : ใกล้ target มากที่สุด (|wp - target| น้อยสุด)
+      min   : เล็กที่สุดที่ยังคุ้ม (wp น้อย แต่ยังพอลดค่าไฟได้จริง)
+      mid   : อยู่กึ่งกลางระหว่าง min กับ near
+    ภายในแต่ละ band เรียงตาม 'คุ้มค่า' (ผลประหยัดปี/ราคา) ถ้ามี ไม่งั้นเรียงตามคืนทุน
+    """
+    labels = {"min": "ขั้นต่ำ (ลงทุนน้อย)",
+              "mid": "ขนาดกลาง",
+              "near": "ใกล้โหลดจริง (เต็มประสิทธิภาพ)"}
+    if "panel_total_wp" not in work.columns or not work["panel_total_wp"].notna().any():
+        # ไม่มีข้อมูลขนาดแผง — คืน top ธรรมดา ไม่มี band
+        out = work.head(int(per_band) * 3).copy()
+        out["tier_label"] = ""
+        return out.reset_index(drop=True), labels
+
+    w = work.dropna(subset=["panel_total_wp"]).copy()
+    w = w[w["panel_total_wp"] > 0]
+    tgt = float(target_wp) if target_wp and target_wp > 0 else float(w["panel_total_wp"].max())
+
+    wp_min = float(w["panel_total_wp"].min())
+    # ขนาดที่ใกล้ target ที่สุด (ยึดเป็นศูนย์กลาง band near)
+    near_wp = float(w.iloc[(w["panel_total_wp"] - tgt).abs().argmin()]["panel_total_wp"])
+    mid_wp = (wp_min + near_wp) / 2.0
+
+    def _rank_within(sub: pd.DataFrame) -> pd.DataFrame:
+        sub = sub.copy()
+        # กันราคาผิดปกติ (พิมพ์ตกหลัก) ไม่ให้ชนะการจัดอันดับความคุ้ม: กรอง บาท/Wp สมเหตุสมผล
+        if "catalog_price" in sub.columns and "panel_total_wp" in sub.columns:
+            ppw = sub["catalog_price"] / sub["panel_total_wp"].replace(0, pd.NA)
+            sane = sub[(ppw >= 10) & (ppw <= 120)]
+            if len(sane):
+                sub = sane
+        if "claimed_saving_year" in sub.columns and "catalog_price" in sub.columns \
+                and sub["catalog_price"].notna().any():
+            sub["_value"] = (sub["claimed_saving_year"].fillna(0)
+                             / sub["catalog_price"].replace(0, pd.NA))
+            return sub.sort_values("_value", ascending=False, na_position="last")
+        if "claimed_payback_years" in sub.columns:
+            return sub.sort_values("claimed_payback_years", na_position="last")
+        return sub
+
+    def _closest_band(center: float, exclude_idx: set) -> pd.DataFrame:
+        pool = w[~w.index.isin(exclude_idx)].copy()
+        if not len(pool):
+            return pool
+        pool["_d"] = (pool["panel_total_wp"] - center).abs()
+        # เลือกแพ็กที่กำลังแผงใกล้ center ที่สุด per_band ตัว แล้วจัดอันดับความคุ้มในนั้น
+        chosen = pool.nsmallest(int(per_band) * 2, "_d")
+        return _rank_within(chosen).head(int(per_band))
+
+    used: set = set()
+    frames = []
+    for tier, center in [("near", near_wp), ("mid", mid_wp), ("min", wp_min)]:
+        band = _closest_band(center, used)
+        if len(band):
+            band = band.copy()
+            band["tier_label"] = labels[tier]
+            band["_band"] = tier
+            used.update(band.index.tolist())
+            frames.append(band)
+
+    if not frames:
+        out = w.head(int(per_band) * 3).copy()
+        out["tier_label"] = ""
+        return out.reset_index(drop=True), labels
+
+    # เรียงแสดง: near -> mid -> min (ใหญ่ไปเล็ก) ให้ลูกค้าเห็นตัวเต็มก่อน
+    order = {"near": 0, "mid": 1, "min": 2}
+    out = pd.concat(frames)
+    out["_ord"] = out["_band"].map(order)
+    out = out.sort_values(["_ord", "panel_total_wp"], ascending=[True, False])
+    out = out.drop(columns=[c for c in ["_d", "_value", "_ord"] if c in out.columns])
+    return out.reset_index(drop=True), labels
 
 
 def _pick_representative_tiers(work: pd.DataFrame, target_wp) -> tuple:
@@ -399,7 +522,42 @@ def _pick_representative_tiers(work: pd.DataFrame, target_wp) -> tuple:
     return tiers, labels
 
 
-def generate_sample_catalog() -> pd.DataFrame:
+def pick_three_solar_sizes(catalog: pd.DataFrame, target_wp: float,
+                           want_battery: bool = True) -> dict:
+    """เลือกขนาดโซลาร์ 3 ระดับจากแคตตาล็อกจริง สำหรับกราฟเทียบพฤติกรรม/กราฟคืนทุน
+      min    : ขนาดเล็กสุดที่มีขาย (ลงทุนน้อย)
+      mid    : ขนาดกลาง (ค่ากลางระหว่าง min กับ near)
+      near   : ขนาดใกล้เป้าหมายการใช้ไฟจริงที่สุด (แต่ไม่เกินที่มีในแคตตาล็อก)
+    คืน dict {label: {'wp':float,'kwp':float,'row':Series|None}} เรียงจากเล็กไปใหญ่
+    ใช้ panel_total_wp ที่ไม่ซ้ำกันเป็นฐาน — เผื่อกรณี target ใหญ่กว่าทุกแพ็ก จะ clamp ที่ใหญ่สุด
+    """
+    df = catalog.copy()
+    if want_battery and "battery_total_kwh" in df.columns:
+        df = df[df["battery_total_kwh"].fillna(0) > 0]
+    if "panel_total_wp" not in df.columns:
+        return {}
+    df = df.dropna(subset=["panel_total_wp"])
+    df = df[df["panel_total_wp"] > 0]
+    if not len(df):
+        return {}
+
+    sizes = sorted(df["panel_total_wp"].unique().tolist())
+    min_wp = sizes[0]
+    # near = ขนาดที่ใกล้ target ที่สุด (ไม่เกินขนาดใหญ่สุดที่มี)
+    tgt = target_wp if (target_wp and target_wp > 0) else sizes[-1]
+    near_wp = min(sizes, key=lambda w: abs(w - tgt))
+    # mid = ขนาดที่ใกล้ค่ากลางระหว่าง min กับ near ที่สุด
+    mid_target = (min_wp + near_wp) / 2.0
+    mid_wp = min(sizes, key=lambda w: abs(w - mid_target))
+
+    picks = {}
+    for label, wp in [("min", min_wp), ("mid", mid_wp), ("near", near_wp)]:
+        row = df[df["panel_total_wp"] == wp].iloc[0]
+        picks[label] = {"wp": float(wp), "kwp": float(wp) / 1000.0, "row": row}
+    return picks
+
+
+
     """สร้างข้อมูล catalog ตัวอย่าง (โครงสร้างเดียวกับไฟล์จริง) สำหรับทดสอบระบบ"""
     rows = [
         dict(period="เม.ย.-มิ.ย.69", pack_id=1, package_code="PKG-SB-001", type="SB",

@@ -13,12 +13,18 @@ import time as _time
 
 from data_parser import parse_customer_bill
 from packages import (parse_package_catalog, generate_sample_catalog,
-                      customer_view, recommend_packages)
+                      customer_view, recommend_packages, pick_three_solar_sizes,
+                      required_system_wp)
 from finance import simple_payback, npv, irr, discounted_payback
 from tariff import TariffModel
-from sim_bridge import simulate_package_savings
+from sim_bridge import simulate_package_savings, _monthly_bill
+from optimizer import _infer_dt_hours
 from analysis import (day_night_monthly_summary, linear_trend,
-                      demand_peak_monthly, estimate_savings_from_monthly)
+                      demand_peak_monthly, estimate_savings_from_monthly,
+                      monthly_total_kwh, hourly_avg_profile, solar_hourly_profile)
+from quant import (build_hourly_profiles, estimate_growth, monthly_total_kwh_simple,
+                   min_sensible_kwp, size_sweep, pick_sweep_options,
+                   monte_carlo_payback, score_lead, project_future_kwh)
 
 st.set_page_config(page_title="Solar & Battery — วิเคราะห์การขาย", layout="wide")
 
@@ -27,11 +33,14 @@ NEO_CSS = """<style>
 
 :root{
   --ink:#111111;
-  --paper:#FBF8EF;
-  --lilac:#E4D4FB;
+  /* ธีมสีม่วงอ่อนตาม PEA (จาก palette: #D4BFFB, #8C6EF1, #FF87F5, #EFA9A6)
+     พื้นหลังใช้ม่วงอ่อนมากๆ ไม่เข้ม อ่านสบายตา */
+  --paper:#F3EEFC;
+  --lilac:#D4BFFB;
+  --purple:#8C6EF1;
   --mint:#B7F0CE;
   --pink:#F9CBDD;
-  --cream:#FBF1CE;
+  --cream:#E9DEFB;
   --blue:#CED6FA;
   --shadow:6px 6px 0 0 var(--ink);
   --shadow-sm:4px 4px 0 0 var(--ink);
@@ -243,9 +252,72 @@ def _nice_range(series, pad_frac: float = 0.18):
     return [max(0.0, lo - span * pad_frac), hi + span * pad_frac]
 
 
+def _quant_block(q) -> str:
+    """แถบสรุปผลวิเคราะห์เชิงลึก (ขนาดคุ้มสุด + ช่วงคืนทุน) สำหรับหน้าสรุปส่งลูกค้า"""
+    if not q or not q.get("opts"):
+        return ""
+    names = {"floor": "ขั้นต่ำที่สมเหตุสมผล", "best": "คุ้มที่สุด (แนะนำ)",
+             "target": "ใกล้เป้าหมายการใช้ไฟ"}
+    rows = ""
+    for k, r in q["opts"].items():
+        mc = q.get("mc", {}).get(k)
+        pb = (f'{mc["payback_p10"]:.1f}–{mc["payback_p90"]:.1f} ปี' if mc
+              else f'{r["payback_years"]:.1f} ปี')
+        brand = str(r.get("inverter_brand") or "-")
+        if r.get("battery_brand"):
+            brand += f'<br><span style="font-size:11px;color:#555;">แบต {r["battery_brand"]}</span>'
+        rows += (f"<tr><td><b>{names.get(k, k)}</b></td>"
+                 f"<td>{r['kwp_total']:,.0f} kWp ({int(r['n_units'])} ชุด)</td>"
+                 f"<td>{brand}</td>"
+                 f"<td>{r['capex']:,.0f} บาท</td>"
+                 f"<td>{r['saving_month']:,.0f} บาท/เดือน</td>"
+                 f"<td>{pb}</td>"
+                 f"<td>{r['self_consumption_ratio']:.0%}</td></tr>")
+    g = q.get("growth", {})
+    note = ""
+    if g:
+        note = (f"<p style='font-size:12px;color:#555;'>แนวโน้มการใช้ไฟของลูกค้า "
+                f"{g['growth_rate']:+.1%}/ปี ({g.get('method','')}) · "
+                f"เป้าหมายเผื่ออนาคต ≈ {q.get('target_kwp',0):,.0f} kWp · "
+                f"เปรียบเทียบทั้งหมด {q.get('sweep_n',0)} ตัวเลือก</p>")
+    return (f"<h2>ตัวเลือกที่แนะนำ (วิเคราะห์จากการใช้ไฟจริง)</h2>"
+            f"<table><thead><tr><th>ตัวเลือก</th><th>ขนาด</th><th>ยี่ห้อ</th>"
+            f"<th>เงินลงทุน</th><th>ประหยัด</th><th>คืนทุน (ช่วงที่เป็นไปได้)</th>"
+            f"<th>ใช้ไฟโซลาร์เอง</th></tr></thead><tbody>{rows}</tbody></table>{note}"
+            f"<p style='font-size:12px;color:#555;'>ช่วงคืนทุนมาจากการสุ่มสมมติฐาน 300 รอบ "
+            f"(แดดปีดี/ปีแย่, ค่าไฟขึ้นเร็ว/ช้า, แผงเสื่อม, ค่าดูแลรักษา) "
+            f"จึงเป็นช่วงที่เป็นไปได้จริง ไม่ใช่ตัวเลขรับประกัน</p>")
+
+
+def _usage_profile_block(up) -> str:
+    """แถบสรุปพฤติกรรมการใช้ไฟ (เดือนมากสุด/น้อยสุด + ขนาดโซลาร์ที่เหมาะ) สำหรับหน้าสรุป
+    up: dict {'hi_label','hi_kwh','lo_label','lo_kwh','target_kwp','sizes':[(name,kwp)...]}
+    """
+    if not up:
+        return ""
+    rows = ""
+    if up.get("hi_label"):
+        rows += (f"<tr><td>เดือนใช้ไฟมากสุด</td><td>{up['hi_label']}</td>"
+                 f"<td>{up.get('hi_kwh',0):,.0f} kWh</td></tr>")
+    if up.get("lo_label"):
+        rows += (f"<tr><td>เดือนใช้ไฟน้อยสุด</td><td>{up['lo_label']}</td>"
+                 f"<td>{up.get('lo_kwh',0):,.0f} kWh</td></tr>")
+    if up.get("target_kwp"):
+        rows += (f"<tr><td>ขนาดระบบที่เหมาะกับการใช้ไฟ</td>"
+                 f"<td colspan='2'>≈ {up['target_kwp']:.0f} kWp</td></tr>")
+    for name, kwp in up.get("sizes", []):
+        rows += f"<tr><td>ตัวเลือกโซลาร์: {name}</td><td colspan='2'>{kwp:.0f} kWp</td></tr>"
+    if not rows:
+        return ""
+    return (f"<h2>พฤติกรรมการใช้ไฟ (จากข้อมูลจริง)</h2>"
+            f"<table><tbody>{rows}</tbody></table>")
+
+
 def _build_onepager_html(meta, avg_kwh, avg_cost, fin_rows, pkg_df, has_batt=True,
-                         saving_source="claim") -> str:
-    """สรุปหน้าเดียวส่งลูกค้า (เปิดในเบราว์เซอร์ -> Ctrl+P -> Save as PDF)"""
+                         saving_source="claim", usage_profile=None, quant=None) -> str:
+    """สรุปหน้าเดียวส่งลูกค้า (เปิดในเบราว์เซอร์ -> Ctrl+P -> Save as PDF)
+    usage_profile: dict ผลวิเคราะห์พฤติกรรม (เดือนมากสุด/น้อยสุด, เป้าหมาย kWp) หรือ None
+    """
     biz = meta.get("business_type") or "ไม่ระบุ"
     meter = meta.get("meter_type") or ""
     cost_txt = f"{avg_cost:,.0f} บาท" if avg_cost else "—"
@@ -281,15 +353,15 @@ def _build_onepager_html(meta, avg_kwh, avg_cost, fin_rows, pkg_df, has_batt=Tru
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap');
 body{{font-family:'Sarabun',sans-serif;color:#111;max-width:900px;margin:24px auto;padding:0 20px;}}
-h1{{font-size:1.6rem;border-bottom:4px solid #3B2A6B;padding-bottom:8px;}}
-h2{{font-size:1.15rem;margin-top:24px;color:#3B2A6B;}}
+h1{{font-size:1.6rem;border-bottom:4px solid #8C6EF1;padding-bottom:8px;}}
+h2{{font-size:1.15rem;margin-top:24px;color:#6B4FC7;}}
 .kpis{{display:flex;gap:14px;margin:16px 0;}}
 .kpi{{flex:1;border:3px solid #111;border-radius:12px;padding:12px;text-align:center;box-shadow:4px 4px 0 #111;}}
 .kpi .n{{font-size:1.4rem;font-weight:700;}}
 .kpi .l{{font-size:.8rem;opacity:.7;}}
 table{{width:100%;border-collapse:collapse;margin:10px 0;font-size:.8rem;}}
 th,td{{border:1px solid #999;padding:6px 8px;text-align:center;}}
-th{{background:#E4D4FB;font-weight:600;}}
+th{{background:#D4BFFB;font-weight:600;}}
 .note{{font-size:.75rem;color:#777;margin-top:20px;border-top:1px dashed #ccc;padding-top:10px;}}
 </style></head><body>
 <h1>ข้อเสนอระบบโซลาร์ + {batt_txt}</h1>
@@ -299,6 +371,8 @@ th{{background:#E4D4FB;font-weight:600;}}
 <div class="kpi"><div class="n">{avg_kwh:,.0f}</div><div class="l">หน่วย/เดือน (kWh)</div></div>
 <div class="kpi"><div class="n">{cost_txt}</div><div class="l">ค่าไฟเฉลี่ย/เดือน</div></div>
 </div>
+{_usage_profile_block(usage_profile)}
+{_quant_block(quant)}
 <h2>แพ็กเกจแนะนำ</h2>
 {table(pkg_df)}
 <h2>สรุปการเงิน</h2>
@@ -421,7 +495,9 @@ with st.sidebar:
     st.markdown("## 2) ความต้องการลูกค้า")
     want_battery = st.radio("ลูกค้าต้องการแบตเตอรี่ไหม",
                             ["มีแบตเตอรี่", "ไม่เอาแบต (โซลาร์อย่างเดียว)"])
-    batt_min_kwh, batt_max_kwh = st.slider("ช่วงความจุแบตที่รับได้ (kWh)", 0, 40, (5, 20))
+    # เพดานแบตขยายเป็น 300 kWh (เดิม 40) เพื่อรองรับระบบเชิงพาณิชย์ขนาดใหญ่จริง
+    # เช่นลูกค้าโหลด 150-200 kW ที่ต้องใช้แบตหลายก้อนรวมกัน
+    batt_min_kwh, batt_max_kwh = st.slider("ช่วงความจุแบตที่รับได้ (kWh)", 0, 300, (5, 100))
     phase_pref = st.selectbox("ระบบไฟ", ["ทั้งหมด", "1 Phase", "3 Phase"])
     # #3: พื้นที่ติดตั้งที่ลูกค้ามี (0 = ไม่จำกัด/ไม่ทราบ)
     avail_area = st.number_input("พื้นที่หลังคาที่ติดตั้งได้ (ตร.ม., 0 = ไม่จำกัด)",
@@ -442,33 +518,36 @@ with st.sidebar:
     op_start, op_end = st.slider("ช่วงเวลา On-Peak (ชั่วโมง)", 0, 24, (9, 22))
     weekdays_only = st.checkbox("On-Peak เฉพาะ จ-ศ (TOU)", value=True)
 
-    st.markdown("## 4) สมมติฐานการเงิน")
-    horizon_years = st.number_input("อายุโครงการ (ปี)", value=10, min_value=1, max_value=30)
-    escalation = st.slider("ค่าไฟปรับขึ้นต่อปี (%)", 0, 10, 3) / 100
-    discount_rate = st.slider("อัตราคิดลด (%)", 0, 15, 5) / 100
-    max_show = st.slider("แสดงกี่แพ็กเกจที่เหมาะสุด", 5, 15, 10)
-
-    st.markdown("## 5) การคำนวณผลประหยัด")
+    st.markdown("## 4) การคำนวณผลประหยัด")
     # #1: เลือกให้คำนวณจากข้อมูลจริง (ต้องมี interval data) แทนตัวเลขเคลมจาก catalog
     use_sim = st.checkbox("คำนวณผลประหยัดจากข้อมูลจริงของลูกค้า (จำลอง)", value=True,
                           help="มีไฟล์รายช่วง (interval) = จำลองเต็มรูปแบบ · "
                                "มีแค่บิลรายเดือน = ประเมินเป็นช่วง (range) แทน")
-    specific_yield = st.slider("ผลผลิตโซลาร์ (kWh/kWp/วัน)", 3.0, 5.0, 4.0, step=0.1,
-                               help="ไทยเฉลี่ย ~3.5-4.5 ขึ้นกับพื้นที่/ทิศทาง/องศาแผง")
+    specific_yield = st.slider("ผลผลิตโซลาร์ (kWh/kWp/วัน)", 3.0, 5.0, 4.5, step=0.1,
+                               help="ไทยเฉลี่ย ~4.0-4.8 ขึ้นกับพื้นที่/ทิศทาง/องศาแผง")
     sc_low, sc_high = st.slider(
         "ช่วง Self-consumption ที่คาด (%) — ใช้เฉพาะกรณีมีแค่บิลรายเดือน",
         10, 100, (50, 90), step=5,
         help="สัดส่วนไฟโซลาร์ที่ลูกค้า 'ใช้เอง' — ไม่รู้แน่ถ้าไม่มีโหลดโปรไฟล์ "
              "จึงประเมินผลประหยัดเป็นช่วง ไม่ฟันธงตัวเลขเดียว")
 
-    st.markdown("## 6) เทมเพลตไฟล์ลูกค้า")
-    from template_builder import build_template_bytes
+    st.markdown("## 5) เทมเพลตไฟล์ลูกค้า")
+    from template_builder import build_template_bytes, build_lead_batch_examples
     st.download_button(
         "ดาวน์โหลดเทมเพลตกรอกข้อมูลลูกค้า (.xlsx)",
         data=build_template_bytes(),
         file_name="เทมเพลตข้อมูลลูกค้า.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         help="มีตัวอย่างครบทั้งกรณีโหลดโปรไฟล์ 15 นาที และกรณีมีแค่บิลรายเดือน")
+
+# ---- สมมติฐานการเงิน (ค่าคงที่มาตรฐาน — เดิมเป็นสไลเดอร์แต่แทบไม่มีใครปรับ) ----
+# ถ้าต้องการเปลี่ยน แก้ตัวเลขตรงนี้ได้เลย
+HORIZON_YEARS = 10        # อายุโครงการที่ใช้คิด NPV/IRR (ปี)
+ESCALATION = 0.03         # ค่าไฟปรับขึ้นเฉลี่ยต่อปี (3%)
+DISCOUNT_RATE = 0.05      # อัตราคิดลด (5%)
+MAX_SHOW = 10             # จำนวนแพ็กเกจที่แสดงในตารางแนะนำ
+horizon_years, escalation = HORIZON_YEARS, ESCALATION
+discount_rate, max_show = DISCOUNT_RATE, MAX_SHOW
 
 # สร้าง TariffModel จากค่าที่ตั้งใน UI (ใช้ทั้งการจำลองและ On/Off-Peak — แก้ #8)
 tariff_model = TariffModel(
@@ -482,7 +561,29 @@ tariff_model = TariffModel(
 # หัวข้อ (เปลี่ยนตามว่ามีแบตหรือไม่)
 # ---------------------------------------------------------------------------
 _has_batt = want_battery.startswith("มีแบต")
+quant_ctx = {}   # ผลวิเคราะห์เชิงลึก (คำนวณในบล็อก interval ด้านล่าง) ใช้ร่วมกันหลายส่วน
 _title_suffix = "แบตเตอรี่" if _has_batt else "ไม่มีแบตเตอรี่"
+
+# โลโก้ PEA Easy D / EZD — ทำด้วยข้อความ+สีตาม palette (ไม่ได้ก็อปไฟล์โลโก้ตราสินค้า)
+st.markdown(
+    '<div style="display:inline-flex;flex-direction:column;align-items:center;'
+    'background:#ffffff;border:3px solid var(--ink);border-radius:16px;'
+    'box-shadow:var(--shadow-sm);padding:.6rem 1.4rem;margin-bottom:1rem;">'
+    '<div style="font-family:\'Space Grotesk\',sans-serif;font-weight:700;'
+    'font-size:1.9rem;line-height:1;letter-spacing:-0.01em;">'
+    '<span style="color:#8E2C8E;">PEA</span> '
+    '<span style="color:#2AA0DE;">Easy</span> '
+    '<span style="color:#7CB82F;">D</span>'
+    '<span style="color:#2AA0DE;font-size:1.1rem;vertical-align:super;">&#127760;</span>'
+    '</div>'
+    '<div style="font-family:\'Space Grotesk\',sans-serif;font-weight:700;'
+    'font-size:1rem;letter-spacing:0.25em;margin-top:.15rem;">'
+    '<span style="color:#8E2C8E;">E</span>'
+    '<span style="color:#2AA0DE;">Z</span>'
+    '<span style="color:#7CB82F;">D</span>'
+    '</div></div>',
+    unsafe_allow_html=True)
+
 st.markdown(f"# วิเคราะห์ระบบโซลาร์ + {_title_suffix} เพื่อการขาย")
 st.markdown('<p style="font-family:IBM Plex Mono,monospace;font-size:.85rem;opacity:.8;'
             'margin-top:-.5rem;">อัปโหลด 2 ไฟล์ที่แถบซ้าย แล้วระบบจะคัดแพ็กเกจที่เหมาะ '
@@ -517,6 +618,7 @@ if bill is None and catalog is None:
 # สรุปการใช้ไฟลูกค้า
 # ---------------------------------------------------------------------------
 avg_kwh = avg_cost = 0.0
+avg_cost_is_estimate = False
 meta = {}
 if bill is not None:
     meta = bill.get("meta", {})
@@ -530,6 +632,21 @@ if bill is not None:
     elif bill["mode"] == "interval" and bill["data"] is not None and len(bill["data"]):
         idf = bill["data"]
         avg_kwh = float(idf["load_kw"].mean()) * 24 * 30
+        # ลูกค้าที่มีข้อมูลรายช่วงมักกรอกแค่ kWh ไม่มีคอลัมน์ค่าไฟ (บาท) ต่อช่วง
+        # ประเมิน "ค่าไฟเฉลี่ย/เดือน" จากโหลดจริง + อัตราค่าไฟ (TOU) ที่ตั้งไว้ในแถบซ้าย
+        # แทนที่จะปล่อยว่าง — คำนวณแบบเดียวกับ baseline_bill ในโมดูลจำลอง (ก่อนติดระบบ)
+        try:
+            idf_ts = idf.copy()
+            idf_ts["timestamp"] = pd.to_datetime(idf_ts["timestamp"])
+            idf_ts = idf_ts.dropna(subset=["timestamp", "load_kw"]).sort_values("timestamp")
+            dt_est = _infer_dt_hours(idf_ts)
+            n_days_est = max(1, idf_ts["timestamp"].dt.date.nunique())
+            grid_kwh = (idf_ts["load_kw"] * dt_est).tolist()
+            avg_cost = _monthly_bill(list(idf_ts["timestamp"]), grid_kwh, tariff_model,
+                                     dt_est, n_days_est)
+            avg_cost_is_estimate = True
+        except Exception:
+            avg_cost = 0.0  # เผื่อข้อมูลผิดปกติจนคำนวณไม่ได้ — กลับไปโชว์ "ไม่ระบุ" เหมือนเดิม
 
     card_open("สรุปการใช้ไฟของลูกค้า", "neo-cream")
     c1, c2, c3 = st.columns(3)
@@ -545,9 +662,34 @@ if bill is not None:
                     f'<div class="kpi-lab">หน่วย kWh</div></div>', unsafe_allow_html=True)
     with c3:
         lab = f"{avg_cost:,.0f}" if avg_cost else "ไม่ระบุ"
+        sub_lab = "บาท (ประมาณจากอัตราค่าไฟ + โหลดจริง)" if avg_cost_is_estimate else "บาท"
         st.markdown(f'<div class="neo-card neo-pink"><div class="eyebrow">ค่าไฟเฉลี่ย/เดือน</div>'
                     f'<div class="kpi-num">{lab}</div>'
-                    f'<div class="kpi-lab">บาท</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-lab">{sub_lab}</div></div>', unsafe_allow_html=True)
+
+    # เกรดความน่าสนใจของลูกค้า (ข้อ4) — ใช้ตัดสินใจว่าควรเข้าไปคุยก่อนไหม
+    if bill["mode"] == "interval" and bill["data"] is not None and len(bill["data"]):
+        try:
+            _lead_prof = build_hourly_profiles(bill["data"])
+            _lead_mk = monthly_total_kwh_simple(bill["data"])
+            _lead_g = estimate_growth(_lead_mk)["growth_rate"] if len(_lead_mk) >= 3 else 0.0
+            lead = score_lead(_lead_prof, avg_kwh, avg_cost, growth_rate=_lead_g)
+            _gcolor = {"A": "neo-mint", "B": "neo-cream", "C": "neo-pink"}.get(
+                lead["grade"], "neo-cream")
+            _gtext = {"A": "น่าสนใจสูง — ควรเข้าไปคุยก่อน",
+                      "B": "น่าสนใจปานกลาง",
+                      "C": "น่าสนใจน้อย — โซลาร์อาจไม่คุ้มนัก"}.get(lead["grade"], "")
+            st.markdown(
+                f'<div class="neo-card {_gcolor}" style="margin-top:.8rem;padding:.8rem 1rem;">'
+                f'<div class="eyebrow">เกรดความน่าสนใจของลูกค้ารายนี้ (Lead Score)</div>'
+                f'<div style="display:flex;align-items:baseline;gap:.8rem;">'
+                f'<div class="kpi-num" style="font-size:2.2rem;">{lead["grade"]}</div>'
+                f'<div style="font-weight:600;">{lead["score"]:.0f}/100 — {_gtext}</div></div>'
+                f'<div class="kpi-lab" style="margin-top:.3rem;">'
+                + " · ".join(lead["reasons"]) +
+                '</div></div>', unsafe_allow_html=True)
+        except Exception:
+            pass
     card_close()
 
     if bill["mode"] == "monthly" and len(bill["monthly"]):
@@ -740,78 +882,160 @@ if bill is not None:
                     st.dataframe(dp_show, use_container_width=True)
             card_close()
 
-        card_open("กราฟพฤติกรรมการใช้ไฟ (แบบหน้าจอ monitor)", "neo-mint")
-        # #15: เตือนให้ชัดว่าเส้น PV/SOC เป็นการจำลอง ไม่ใช่ค่าวัดจริงหน้างาน
-        st.warning("เฉพาะ **เส้นโหลด (ชมพู)** คือข้อมูลจริงจากไฟล์ลูกค้า · "
-                   "เส้น PV โซลาร์และ SOC แบตเป็น **การจำลองเพื่อดูภาพรวมเท่านั้น** "
-                   "ไม่ใช่ค่าที่จะได้จากการติดตั้งจริง")
+        # -------------------------------------------------------------------
+        # กราฟเทียบพฤติกรรม: โปรไฟล์โหลดเฉลี่ยรายชั่วโมง (เดือนใช้ไฟมากสุด/น้อยสุด)
+        # เทียบกับ PV โซลาร์ 3 ขนาด (เล็กสุด/กลาง/ใกล้โหลดจริง) + SOC แบต (ถ้ามี)
+        # แทนกราฟ monitor เดิมที่โชว์ได้แค่ช่วงสั้นๆ และต้องเลื่อนสไลเดอร์วัน
+        # -------------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # คำนวณ Quant ก่อนวาดกราฟ เพื่อให้ "ขนาดโซลาร์ในกราฟ" ตรงกับ
+        # "3 ตัวเลือกที่แนะนำ" ด้านล่าง (ขั้นต่ำ / คุ้มสุด / ใกล้เป้าหมาย)
+        # -------------------------------------------------------------------
+        if catalog is not None and len(catalog):
+            with st.spinner("กำลังไล่คำนวณทุกขนาดที่ติดตั้งได้จริง..."):
+                _prof = build_hourly_profiles(idf)
+                _mk = monthly_total_kwh_simple(idf)
+                _growth = estimate_growth(_mk)
+                _fut_kwh = project_future_kwh(avg_kwh, _growth["growth_rate"],
+                                              years_ahead=2.5)
+                _minsz = min_sensible_kwp(_prof, specific_yield)
+                _target_kwp_q = required_system_wp(_fut_kwh, specific_yield) / 1000.0
+                _sweep = size_sweep(catalog, _prof, tariff_model, want_battery=_has_batt,
+                                    specific_yield=specific_yield,
+                                    horizon_years=int(horizon_years),
+                                    discount_rate=discount_rate, escalation=escalation,
+                                    max_units=4, avail_area_sqm=(avail_area or None))
+                _opts = pick_sweep_options(_sweep, _minsz["kwp"], _target_kwp_q) \
+                    if len(_sweep) else {}
+            quant_ctx = {"prof": _prof, "growth": _growth, "minsz": _minsz,
+                         "opts": _opts, "sweep": _sweep, "target_kwp": _target_kwp_q,
+                         "fut_kwh": _fut_kwh, "sweep_n": len(_sweep)}
 
-        # จำนวนวันที่ข้อมูลครอบคลุมจริง (นับจากช่วงเวลา ไม่ใช่หารจำนวนแถวแบบตายตัว)
-        # กันเคสข้อมูลวันเดียว/ช่วงสั้น ที่ทำให้ st.slider ได้ min==max แล้ว crash
-        span = idf["timestamp"].max() - idf["timestamp"].min()
-        total_days = max(1, int(span.total_seconds() // 86400) + 1)
-        max_days = min(30, total_days)
+        mt = monthly_total_kwh(idf)
+        if len(mt) >= 1:
+            card_open("เทียบโหลดจริงของลูกค้า กับ PV โซลาร์ 3 ขนาด", "neo-mint")
+            st.warning("**เส้นโหลด (ชมพู)** = โปรไฟล์เฉลี่ยรายชั่วโมงจากข้อมูลจริงของลูกค้า · "
+                       "เส้นโซลาร์และ SOC แบตเป็น **การจำลอง** จากขนาดระบบ ไม่ใช่ค่าติดตั้งจริง")
 
-        colsel1, colsel2 = st.columns([2, 1])
-        with colsel2:
-            show_pv = st.checkbox("จำลอง PV โซลาร์", value=True, key="behav_pv")
-        with colsel1:
-            if max_days >= 2:
-                n_days = st.slider("แสดงข้อมูลกี่วัน", 1, max_days,
-                                   min(7, max_days), key="behav_days")
+            # ใช้ "3 ขนาดเดียวกับตัวเลือกที่แนะนำ" (ขั้นต่ำ/คุ้มสุด/ใกล้เป้าหมาย)
+            # เพื่อให้กราฟสอดคล้องกับตัวเลขที่เซลเอาไปเสนอจริง
+            _qopts = quant_ctx.get("opts") or {}
+            size_colors = {"floor": "#5B9E62", "best": "#E8A33D", "target": "#2E5FA3"}
+            size_names = {"floor": "ขั้นต่ำที่สมเหตุสมผล", "best": "คุ้มสุด (แนะนำ)",
+                          "target": "ใกล้เป้าหมายการใช้ไฟ"}
+            solar_sizes = {}
+            for _k in ("floor", "best", "target"):
+                if _k in _qopts:
+                    _r = _qopts[_k]
+                    solar_sizes[_k] = {"kwp": float(_r["kwp_total"]),
+                                       "batt": float(_r["battery_kwh_total"]),
+                                       "n_units": int(_r["n_units"])}
+            # สำรอง: ถ้ายังไม่มีผล quant (เช่นไม่มีแคตตาล็อก) ใช้วิธีเดิมจากแคตตาล็อก
+            if not solar_sizes and catalog is not None and len(catalog):
+                _tw = required_system_wp(avg_kwh, specific_yield)
+                _ps = pick_three_solar_sizes(catalog, _tw, want_battery=_has_batt)
+                size_colors = {"min": "#5B9E62", "mid": "#E8A33D", "near": "#2E5FA3"}
+                size_names = {"min": "โซลาร์ขั้นต่ำ", "mid": "โซลาร์ขนาดกลาง",
+                              "near": "โซลาร์ใกล้โหลดจริง"}
+                solar_sizes = {k: {"kwp": v["kwp"],
+                                   "batt": float(v["row"].get("battery_total_kwh") or 0),
+                                   "n_units": 1}
+                               for k, v in _ps.items()}
+
+            def _profile_chart(period, title):
+                prof = hourly_avg_profile(idf, period)
+                fig = go.Figure()
+                # โหลดจริงเฉลี่ยรายชั่วโมง (เส้นทึบชมพู)
+                fig.add_trace(go.Scatter(
+                    x=prof["hour"], y=prof["load_kw"], name="โหลดเฉลี่ยจริง (kW)",
+                    mode="lines", line=dict(color="#D14D72", width=3)))
+                # PV ตามขนาดที่แนะนำ (วนตามคีย์ที่มีจริง รองรับทั้ง quant และสำรอง)
+                for key in solar_sizes:
+                    kwp = solar_sizes[key]["kwp"]
+                    nu = solar_sizes[key].get("n_units", 1)
+                    pv = solar_hourly_profile(kwp, specific_yield)
+                    _sfx = f" ({nu} ชุด)" if nu > 1 else ""
+                    fig.add_trace(go.Scatter(
+                        x=list(range(24)), y=pv,
+                        name=f"{size_names.get(key, key)} {kwp:,.0f} kWp{_sfx}",
+                        mode="lines", line=dict(color=size_colors.get(key, "#888"),
+                                                width=2)))
+                # SOC แบต (เส้นประ) — ใช้แบตของตัวเลือก 'คุ้มสุด' เป็นตัวแทน
+                _soc_key = ("best" if "best" in solar_sizes
+                            else ("near" if "near" in solar_sizes else None))
+                if _has_batt and _soc_key:
+                    cap = float(solar_sizes[_soc_key].get("batt") or 0)
+                    if cap > 0:
+                        pv_ref = solar_hourly_profile(solar_sizes[_soc_key]["kwp"],
+                                                      specific_yield)
+                        soc, soc_series = cap * 0.2, []
+                        for h in range(24):
+                            _lv = prof["load_kw"].iloc[h]
+                            net = pv_ref[h] - (0 if pd.isna(_lv) else float(_lv))
+                            soc = min(cap, max(cap * 0.2, soc + net * 1.0))  # dt=1ชม.
+                            soc_series.append(soc / cap * 100)
+                        fig.add_trace(go.Scatter(
+                            x=list(range(24)), y=soc_series,
+                            name=f"SOC แบต {cap:,.0f} kWh (%) จำลอง",
+                            mode="lines", yaxis="y2",
+                            line=dict(color="#111111", width=2, dash="dot")))
+
+                lay = dict(
+                    title=dict(text=title, x=0.5, font=dict(size=15)),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.55)",
+                    font=dict(family="Space Grotesk, sans-serif", color="#111"),
+                    xaxis=dict(title="ชั่วโมง (0-23 น.)", dtick=3,
+                               gridcolor="rgba(17,17,17,0.06)"),
+                    yaxis=dict(title="กำลังไฟเฉลี่ย (kW)", rangemode="tozero",
+                               gridcolor="rgba(17,17,17,0.08)"),
+                    legend=dict(orientation="h", y=-0.22), height=400,
+                    margin=dict(l=10, r=10, t=48, b=10))
+                if _has_batt and _soc_key and float(
+                        solar_sizes[_soc_key].get("batt") or 0) > 0:
+                    lay["yaxis2"] = dict(title="SOC (%)", overlaying="y",
+                                         side="right", range=[0, 100])
+                fig.update_layout(**lay)
+                return fig
+
+            hi = mt.loc[mt["total_kwh"].idxmax()]
+            lo = mt.loc[mt["total_kwh"].idxmin()]
+            # กันเดือนที่ข้อมูลไม่ครบ (เช่น <20 วัน จากไฟล์ที่กรอกตกหล่น) มาเป็น 'เดือนน้อยสุด'
+            # เพราะจะทำให้โปรไฟล์เพี้ยน — ใช้เฉพาะเดือนที่มีวันข้อมูลพอสมควร
+            mt_full = mt[mt["n_days"] >= 20]
+            if len(mt_full) >= 2:
+                hi = mt_full.loc[mt_full["total_kwh"].idxmax()]
+                lo = mt_full.loc[mt_full["total_kwh"].idxmin()]
+                n_incomplete = int((mt["n_days"] < 20).sum())
+                if n_incomplete:
+                    st.caption(f"⚠️ ข้าม{n_incomplete}เดือนที่ข้อมูลไม่ครบ (<20วัน) "
+                               "ในการเลือกเดือนมากสุด/น้อยสุด")
+            c_hi, c_lo = st.columns(2)
+            with c_hi:
+                st.plotly_chart(
+                    _profile_chart(hi["month"],
+                                   f'เดือนใช้ไฟมากสุด — {hi["month_label"]} '
+                                   f'({hi["total_kwh"]:,.0f} kWh)'),
+                    use_container_width=True)
+            with c_lo:
+                st.plotly_chart(
+                    _profile_chart(lo["month"],
+                                   f'เดือนใช้ไฟน้อยสุด — {lo["month_label"]} '
+                                   f'({lo["total_kwh"]:,.0f} kWh)'),
+                    use_container_width=True)
+
+            if solar_sizes:
+                sz_txt = " · ".join(
+                    f"{size_names.get(k, k)} {solar_sizes[k]['kwp']:,.0f} kWp"
+                    for k in solar_sizes)
+                _tgt_txt = quant_ctx.get("target_kwp") or (
+                    required_system_wp(avg_kwh, specific_yield) / 1000.0)
+                st.caption(f"เทียบโหลดเฉลี่ยรายชั่วโมงกับขนาดโซลาร์ **ชุดเดียวกับตัวเลือกที่แนะนำ**"
+                           f"ด้านล่าง: {sz_txt} (เป้าหมายจากการใช้ไฟ ≈ {_tgt_txt:,.0f} kWp) "
+                           "· ช่วงที่เส้นโซลาร์สูงกว่าโหลด = ไฟเหลือไปชาร์จแบต/เหลือทิ้ง "
+                           "· ช่วงที่โหลดสูงกว่า = ยังต้องซื้อไฟบางส่วน")
             else:
-                # ข้อมูลครอบคลุมช่วงสั้น (เช่น ตัวอย่างลูกค้ารายช่วง 15 นาที ไม่กี่จุด)
-                # แสดงทั้งหมดไปเลย ไม่ต้องมีสไลเดอร์
-                n_days = 1
-                st.caption(f"ข้อมูลครอบคลุมช่วงสั้น ({len(idf):,} จุด ภายใน ~1 วัน) — แสดงทั้งหมด")
-
-        # ตัดข้อมูลตามจำนวนวันจากต้น
-        start_ts = idf["timestamp"].iloc[0]
-        end_ts = start_ts + pd.Timedelta(days=n_days)
-        seg = idf[(idf["timestamp"] >= start_ts) & (idf["timestamp"] < end_ts)].copy()
-
-        figb = go.Figure()
-        # โหลดจริงของลูกค้า (เส้นทึบชมพู)
-        figb.add_trace(go.Scatter(x=seg["timestamp"], y=seg["load_kw"], name="โหลดที่ใช้ (kW)",
-                                  mode="lines", line=dict(color="#D14D72", width=2.5)))
-
-        if show_pv:
-            # จำลอง PV จากรูประฆังคว่ำกลางวัน สูงสุด ~ ค่าพีคโหลด
-            peak_load = float(seg["load_kw"].max()) if len(seg) else 5.0
-            hours = seg["timestamp"].dt.hour + seg["timestamp"].dt.minute / 60
-            import numpy as _np
-            pv = _np.where((hours >= 6) & (hours <= 18),
-                           peak_load * 0.9 * _np.sin(_np.pi * (hours - 6) / 12).clip(0), 0)
-            figb.add_trace(go.Scatter(x=seg["timestamp"], y=pv, name="PV โซลาร์ที่ผลิต (kW)",
-                                      mode="lines", line=dict(color="#E8A33D", width=2.5)))
-
-            if _has_batt:
-                # จำลอง SOC ง่ายๆ: PV เหลือชาร์จเข้า / โหลดเกินดึงออก
-                cap = float(batt_max_kwh) if batt_max_kwh else 10.0
-                soc_kwh, soc_series = cap * 0.5, []
-                dt_h = 0.25  # สมมติราย 15 นาที
-                for ld, pvv in zip(seg["load_kw"].values, pv):
-                    net = pvv - ld
-                    soc_kwh = min(cap, max(cap * 0.2, soc_kwh + net * dt_h))
-                    soc_series.append(soc_kwh / cap * 100)
-                figb.add_trace(go.Scatter(x=seg["timestamp"], y=soc_series, name="ระดับแบต SOC (%)",
-                                          mode="lines", yaxis="y2",
-                                          line=dict(color="#111111", width=2, dash="dot")))
-
-        layout_kw = dict(
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.55)",
-            font=dict(family="Space Grotesk, sans-serif", color="#111"),
-            yaxis=dict(title="กำลังไฟ (kW)"),
-            legend=dict(orientation="h", y=1.15), height=380,
-            margin=dict(l=10, r=10, t=30, b=10))
-        if _has_batt and show_pv:
-            layout_kw["yaxis2"] = dict(title="SOC (%)", overlaying="y", side="right",
-                                       range=[0, 100])
-        figb.update_layout(**layout_kw)
-        st.plotly_chart(figb, use_container_width=True)
-        st.caption("เส้นชมพู = โหลดจริงจากไฟล์ลูกค้า · เส้นส้ม = ประมาณการ PV โซลาร์ "
-                   "· เส้นประดำ = SOC แบต (จำลอง) — ใช้ประเมินภาพรวม ไม่ใช่ค่าติดตั้งจริง")
-        card_close()
+                st.caption("อัปโหลดแคตตาล็อกเพื่อเทียบกับขนาดโซลาร์จริง")
+            card_close()
 if catalog is None or not len(catalog):
     st.info("อัปโหลดไฟล์ catalog (หรือติ๊กใช้ตัวอย่าง) ที่แถบซ้าย เพื่อดูแพ็กเกจแนะนำ")
     st.stop()
@@ -986,6 +1210,154 @@ if rec["dropped"]:
                      use_container_width=True)
 
 # ---------------------------------------------------------------------------
+# วิเคราะห์เชิงลึก (Quant) — ไล่ทุกขนาด หาขนาดคุ้มสุด + ช่วงคืนทุนที่น่าเชื่อถือ
+# ---------------------------------------------------------------------------
+if have_interval and quant_ctx.get("sweep") is not None:
+    card_open("วิเคราะห์เชิงลึก — หาขนาดที่คุ้มที่สุด (ไม่ใช่แค่ขนาดที่ใกล้โหลดสุด)", "neo-blue")
+    # ใช้ผลที่คำนวณไว้แล้วก่อนวาดกราฟพฤติกรรม (ไม่คำนวณซ้ำ)
+    _prof = quant_ctx["prof"]
+    _growth = quant_ctx["growth"]
+    _fut_kwh = quant_ctx["fut_kwh"]
+    _minsz = quant_ctx["minsz"]
+    _target_kwp_q = quant_ctx["target_kwp"]
+    _sweep = quant_ctx["sweep"]
+
+    if not len(_sweep):
+        st.info("ไม่มีแพ็กเกจที่คำนวณได้ (ตรวจสอบแคตตาล็อก/เงื่อนไขแบตเตอรี่)")
+        card_close()
+    else:
+        _opts = quant_ctx["opts"]
+
+        # ---- แถบแนวโน้ม + ขนาดขั้นต่ำ ----
+        gcol1, gcol2 = st.columns(2)
+        _conf_th = {"high": "เชื่อถือได้สูง", "medium": "ปานกลาง",
+                    "low": "ต่ำ (ข้อมูลน้อย)", "none": "ประเมินไม่ได้"}
+        with gcol1:
+            _g = _growth["growth_rate"]
+            _sign = "+" if _g >= 0 else ""
+            st.markdown(
+                f'<div class="neo-card neo-cream" style="padding:.8rem 1rem;">'
+                f'<div class="eyebrow">แนวโน้มการใช้ไฟ (จากข้อมูลลูกค้าเอง)</div>'
+                f'<div class="kpi-num" style="font-size:1.6rem;">{_sign}{_g:.1%} <span '
+                f'style="font-size:.9rem;font-weight:500;">ต่อปี</span></div>'
+                f'<div class="kpi-lab">ความเชื่อมั่น: {_conf_th.get(_growth["confidence"])} '
+                f'· {_growth["method"]}</div></div>', unsafe_allow_html=True)
+        with gcol2:
+            st.markdown(
+                f'<div class="neo-card neo-cream" style="padding:.8rem 1rem;">'
+                f'<div class="eyebrow">ขนาดขั้นต่ำที่สมเหตุสมผล</div>'
+                f'<div class="kpi-num" style="font-size:1.6rem;">{_minsz["kwp"]:,.0f} '
+                f'<span style="font-size:.9rem;font-weight:500;">kWp</span></div>'
+                f'<div class="kpi-lab">{_minsz["method"]}</div></div>',
+                unsafe_allow_html=True)
+        st.caption(f"เป้าหมายเผื่ออนาคต 2-3 ปี ≈ **{_target_kwp_q:,.0f} kWp** "
+                   f"(จากใช้ไฟ {avg_kwh:,.0f} → {_fut_kwh:,.0f} kWh/เดือน) "
+                   "— ระบบประเมินแนวโน้มจากบิลย้อนหลังของลูกค้าเอง ไม่ต้องถามลูกค้าว่าจะขยายกิจการไหม")
+
+        # ---- กราฟ NPV/คืนทุน ต่อขนาด (หัวใจข้อ 3) ----
+        _sw1 = _sweep[_sweep["n_units"] == 1]
+        figq = make_subplots(specs=[[{"secondary_y": True}]])
+        figq.add_trace(go.Scatter(
+            x=_sweep["kwp_total"], y=_sweep["npv"], name="NPV (บาท)",
+            mode="markers", marker=dict(color="#8C6EF1", size=7,
+                                        line=dict(color="#111", width=1))),
+            secondary_y=False)
+        figq.add_trace(go.Scatter(
+            x=_sweep["kwp_total"], y=_sweep["payback_years"], name="คืนทุน (ปี)",
+            mode="markers", marker=dict(color="#D14D72", size=6, symbol="diamond")),
+            secondary_y=True)
+        for _k, _lbl, _c in [("best", "คุ้มสุด (NPV สูงสุด)", "#2E8B57"),
+                             ("floor", "ขั้นต่ำสมเหตุสมผล", "#E8A33D"),
+                             ("target", "ใกล้เป้าหมายการใช้ไฟ", "#2E5FA3")]:
+            if _k in _opts:
+                figq.add_vline(x=float(_opts[_k]["kwp_total"]), line_dash="dash",
+                               line_color=_c, annotation_text=_lbl,
+                               annotation_position="top")
+        figq.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.55)",
+            font=dict(family="Space Grotesk, sans-serif", color="#111"),
+            xaxis=dict(title="ขนาดระบบ (kWp)", gridcolor="rgba(17,17,17,0.06)"),
+            legend=dict(orientation="h", y=1.12), height=420,
+            margin=dict(l=10, r=10, t=60, b=10))
+        figq.update_yaxes(title_text="NPV ตลอดอายุโครงการ (บาท)", secondary_y=False,
+                          gridcolor="rgba(17,17,17,0.08)")
+        figq.update_yaxes(title_text="ระยะคืนทุน (ปี)", secondary_y=True,
+                          rangemode="tozero", showgrid=False)
+        st.plotly_chart(figq, use_container_width=True)
+        st.caption(f"ไล่คำนวณ **{len(_sweep)} ตัวเลือก** (รวมการติดหลายชุดขนานกัน) "
+                   "บนโหลดจริงของลูกค้า · จุดม่วง = NPV (ยิ่งสูงยิ่งดี) · "
+                   "จุดชมพู = ระยะคืนทุน (ยิ่งต่ำยิ่งดี) — "
+                   "**ขนาดที่คุ้มสุดมักไม่ใช่ขนาดที่ใหญ่ที่สุด** เพราะไฟที่ผลิตเกินโหลดจะเหลือทิ้ง")
+
+        # ---- (3) Monte Carlo: สรุปเป็นช่วง P10-P90 ----
+        st.markdown("#### 3 ตัวเลือกที่แนะนำ พร้อมช่วงคืนทุนที่น่าเชื่อถือ")
+        _names = {"floor": "ขั้นต่ำที่สมเหตุสมผล", "best": "คุ้มสุด (แนะนำ)",
+                  "target": "ใกล้เป้าหมายการใช้ไฟ"}
+        _colors = {"floor": "neo-cream", "best": "neo-mint", "target": "neo-blue"}
+        _mc_rows = []
+        _mc_store = {}
+        _ocols = st.columns(len(_opts))
+        for _i, (_k, _row) in enumerate(_opts.items()):
+            _mc = monte_carlo_payback(_prof, float(_row["kwp_total"]),
+                                      float(_row["battery_kwh_total"]),
+                                      float(_row["capex"]), tariff_model,
+                                      specific_yield=specific_yield, n_draws=300,
+                                      horizon_years=int(horizon_years),
+                                      discount_rate=discount_rate,
+                                      escalation_mean=escalation,
+                                      growth_rate=_growth["growth_rate"])
+            if _mc:
+                _mc_store[_k] = _mc
+            with _ocols[_i]:
+                _pb = (f'{_mc["payback_p10"]:.1f}–{_mc["payback_p90"]:.1f}'
+                       if _mc else f'{_row["payback_years"]:.1f}')
+                _brand_txt = str(_row.get("inverter_brand") or "-")
+                if _has_batt and _row.get("battery_brand"):
+                    _brand_txt += f' / แบต {_row["battery_brand"]}'
+                st.markdown(
+                    f'<div class="neo-card {_colors[_k]}" style="padding:.9rem 1rem;">'
+                    f'<div class="eyebrow">{_names[_k]}</div>'
+                    f'<div class="kpi-num" style="font-size:1.7rem;">'
+                    f'{_row["kwp_total"]:,.0f} kWp</div>'
+                    f'<div class="kpi-lab">'
+                    f'{int(_row["n_units"])} ชุด × {_row["kwp_total"]/_row["n_units"]:,.0f} kWp'
+                    f'{" · แบต " + format(_row["battery_kwh_total"], ",.0f") + " kWh" if _has_batt else ""}'
+                    f'</div>'
+                    f'<div class="kpi-lab" style="margin-top:.2rem;font-weight:700;">'
+                    f'{_brand_txt}</div>'
+                    f'<div style="margin-top:.5rem;font-size:.95rem;line-height:1.7;">'
+                    f'ลงทุน <b>{_row["capex"]:,.0f}</b> บาท<br>'
+                    f'ประหยัด <b>{_row["saving_month"]:,.0f}</b> บาท/เดือน<br>'
+                    f'คืนทุน <b>{_pb} ปี</b><br>'
+                    f'ใช้ไฟโซลาร์เอง <b>{_row["self_consumption_ratio"]:.0%}</b>'
+                    f'</div></div>', unsafe_allow_html=True)
+            if _mc:
+                _mc_rows.append({
+                    "ตัวเลือก": _names[_k],
+                    "ขนาด (kWp)": round(float(_row["kwp_total"]), 1),
+                    "จำนวนชุด": int(_row["n_units"]),
+                    "ยี่ห้ออินเวอร์เตอร์": _row.get("inverter_brand") or "-",
+                    **({"ยี่ห้อแบตเตอรี่": _row.get("battery_brand") or "-"}
+                       if _has_batt else {}),
+                    "รหัสแพ็กเกจ": _row.get("package_code") or "-",
+                    "ลงทุน (บาท)": f'{_row["capex"]:,.0f}',
+                    "คืนทุน P10 (เร็ว)": round(_mc["payback_p10"], 1),
+                    "คืนทุน P50 (กลาง)": round(_mc["payback_p50"], 1),
+                    "คืนทุน P90 (ช้า)": round(_mc["payback_p90"], 1),
+                    "โอกาสคืนทุนใน 7 ปี": f'{_mc["prob_payback_under"][7]:.0%}',
+                    "NPV กลาง (บาท)": f'{_mc["npv_p50"]:,.0f}',
+                })
+        if _mc_rows:
+            st.dataframe(pd.DataFrame(_mc_rows), use_container_width=True)
+            st.caption("ช่วงคืนทุนมาจากการ**สุ่มสมมติฐาน 300 รอบ** (แดดปีดี/ปีแย่ ±10%, "
+                       "ค่าไฟขึ้นเร็ว/ช้า, แผงเสื่อม 0.4-0.8%/ปี, ค่าดูแลรักษา 0.5-1.5%/ปี) "
+                       "— **P10 = กรณีดี · P90 = กรณีแย่** เสนอลูกค้าเป็นช่วงจะน่าเชื่อถือกว่า"
+                       "ตัวเลขเป๊ะที่โดนแย้งง่ายภายหลัง")
+
+        quant_ctx["mc"] = _mc_store
+        card_close()
+
+# ---------------------------------------------------------------------------
 # ตารางการเงิน
 # ---------------------------------------------------------------------------
 card_open("ตัวเลขการเงินพร้อมนำเสนอ", "neo-lilac")
@@ -1032,18 +1404,20 @@ card_close()
 # ---------------------------------------------------------------------------
 if fin_rows:
     card_open("กราฟจุดคืนทุน (เส้นตัดเส้นประ = คืนทุนแล้ว)", "neo-pink")
-    # ใช้ 3 แพ็กตัวแทนเดียวกับตาราง: เล็กสุด / ราคากลางคุ้มค่า / ใกล้เป้าหมาย
+    # ใช้ 3 แพ็กตัวแทนตามขนาด: ขั้นต่ำ / กลาง / ใกล้โหลดจริง (ตรงกับ 3 band ในตาราง)
+    # ในแต่ละ band เลือกแพ็กที่คุ้มสุด (คืนทุนเร็วสุด) เป็นตัวแทน
     picks, pick_labels = [], []
     if "tier_label" in top.columns:
-        for tier in ["เล็กสุดที่แนะนำ (ลงทุนน้อย)", "ราคากลาง (คุ้มค่าที่สุด)",
-                     "ใกล้เป้าหมายการใช้ไฟ"]:
-            m = top[top["tier_label"] == tier]
-            m = m.dropna(subset=["catalog_price"])
+        for tier in ["ขั้นต่ำ (ลงทุนน้อย)", "ขนาดกลาง", "ใกล้โหลดจริง (เต็มประสิทธิภาพ)"]:
+            m = top[top["tier_label"] == tier].dropna(subset=["catalog_price"])
             if len(m):
+                # เลือกแพ็กคืนทุนเร็วสุดใน band นี้เป็นตัวแทน
+                if "claimed_payback_years" in m.columns and m["claimed_payback_years"].notna().any():
+                    m = m.sort_values("claimed_payback_years", na_position="last")
                 picks.append(m.iloc[0])
                 pick_labels.append(tier.split(" (")[0])
     if not picks:
-        # fallback: กระจายตามราคา ถ้าไม่มีป้ายตัวแทน
+        # fallback: กระจายตามราคา ถ้าไม่มีป้าย band
         price_sorted = top.dropna(subset=["catalog_price"]).sort_values("catalog_price")
         if len(price_sorted) >= 3:
             picks = [price_sorted.iloc[0], price_sorted.iloc[len(price_sorted)//2],
@@ -1053,7 +1427,7 @@ if fin_rows:
             picks = [price_sorted.iloc[i] for i in range(len(price_sorted))]
             pick_labels = [f"แพ็ก {i+1}" for i in range(len(picks))]
 
-    colors = ["#2E8B57", "#3B2A6B", "#D14D72"]
+    colors = ["#5B9E62", "#E8A33D", "#2E5FA3"]
     figc = go.Figure()
     for i, p in enumerate(picks):
         capex = p["catalog_price"]
@@ -1080,13 +1454,106 @@ if fin_rows:
     card_close()
 
 # ---------------------------------------------------------------------------
+# หาลูกค้าเชิงรุก (Lead Scoring แบบหลายราย) — ข้อ4
+# ---------------------------------------------------------------------------
+card_open("หาลูกค้าเชิงรุก — สแกนหลายรายพร้อมกัน แล้วจัดลำดับ A/B/C", "neo-lilac")
+st.write("อัปโหลดไฟล์โหลดโปรไฟล์ของลูกค้าหลายราย ระบบจะให้คะแนนว่ารายไหน "
+         "**น่าจะคุ้มโซลาร์มากที่สุด** เพื่อให้ทีมขายเข้าไปคุยกับรายที่ปิดดีลง่ายก่อน "
+         "— ใช้กับข้อมูลมิเตอร์ที่ PEA มีอยู่แล้ว ไม่ต้องรอลูกค้าเดินมาหา")
+_lc1, _lc2 = st.columns([1, 2])
+with _lc1:
+    st.download_button(
+        "ดาวน์โหลดไฟล์ตัวอย่าง 3 ราย (.zip)",
+        data=build_lead_batch_examples(),
+        file_name="ตัวอย่างลูกค้าสำหรับสแกน.zip", mime="application/zip",
+        help="แตกไฟล์แล้วลากไฟล์ .xlsx ทั้ง 3 ใส่ช่องอัปโหลดด้านล่างได้เลยเพื่อทดลองใช้")
+with _lc2:
+    st.caption("**1 ไฟล์ = ลูกค้า 1 ราย** (ชื่อไฟล์ = ชื่อลูกค้าในตารางผล) · "
+               "ใช้คอลัมน์ชุดเดียวกับเทมเพลตข้อมูลลูกค้า (กรณี A รายช่วง) · "
+               "ไฟล์ตัวอย่างมีทั้งโรงงานกลางวัน / สำนักงาน / โรงงานกะกลางคืน "
+               "เพื่อให้เห็นความต่างของเกรด")
+batch_files = st.file_uploader("ไฟล์โหลดโปรไฟล์ลูกค้า (เลือกได้หลายไฟล์)",
+                               type=["xlsx", "xls", "csv"], accept_multiple_files=True,
+                               key="batch_leads")
+if batch_files:
+    with st.spinner(f"กำลังวิเคราะห์ {len(batch_files)} ราย..."):
+        _rows = []
+        for _f in batch_files:
+            _name = _f.name.rsplit(".", 1)[0]
+            try:
+                _b = parse_customer_bill(_f)
+                if _b["mode"] != "interval" or _b["data"] is None or not len(_b["data"]):
+                    _rows.append({"ลูกค้า": _name, "เกรด": "-", "คะแนน": 0,
+                                  "หมายเหตุ": "ต้องเป็นข้อมูลรายช่วง (15 นาที/ชั่วโมง)"})
+                    continue
+                _d = _b["data"]
+                _p = build_hourly_profiles(_d)
+                _a = float(_d["load_kw"].mean()) * 24 * 30
+                _m = monthly_total_kwh_simple(_d)
+                _gr = estimate_growth(_m)["growth_rate"] if len(_m) >= 3 else 0.0
+                _s = score_lead(_p, _a, growth_rate=_gr)
+                _rows.append({
+                    "ลูกค้า": _name, "เกรด": _s["grade"], "คะแนน": _s["score"],
+                    "ใช้ไฟ (kWh/เดือน)": round(_a),
+                    "สัดส่วนใช้ไฟกลางวัน": f'{_s.get("day_share", 0):.0%}',
+                    "แนวโน้ม/ปี": f'{_gr:+.1%}',
+                    "หมายเหตุ": " · ".join(_s["reasons"][:2]),
+                })
+            except Exception as e:
+                _rows.append({"ลูกค้า": _name, "เกรด": "-", "คะแนน": 0,
+                              "หมายเหตุ": f"อ่านไฟล์ไม่สำเร็จ: {str(e)[:50]}"})
+        _bdf = pd.DataFrame(_rows).sort_values("คะแนน", ascending=False)
+    _na = int((_bdf["เกรด"] == "A").sum())
+    _nb = int((_bdf["เกรด"] == "B").sum())
+    _nc = int((_bdf["เกรด"] == "C").sum())
+    b1, b2, b3 = st.columns(3)
+    for _c, _lab, _n, _cls in [(b1, "เกรด A — ควรเข้าไปคุยก่อน", _na, "neo-mint"),
+                               (b2, "เกรด B — น่าสนใจปานกลาง", _nb, "neo-cream"),
+                               (b3, "เกรด C — คุ้มน้อย", _nc, "neo-pink")]:
+        with _c:
+            st.markdown(f'<div class="neo-card {_cls}" style="padding:.7rem .9rem;">'
+                        f'<div class="kpi-lab">{_lab}</div>'
+                        f'<div class="kpi-num" style="font-size:1.8rem;">{_n} ราย</div>'
+                        f'</div>', unsafe_allow_html=True)
+    st.dataframe(_bdf, use_container_width=True)
+    st.download_button("ดาวน์โหลดลิสต์ลูกค้า (CSV)",
+                       data=_bdf.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="ลิสต์ลูกค้าน่าสนใจ.csv", mime="text/csv")
+    st.caption("เกณฑ์ให้คะแนน: สัดส่วนใช้ไฟกลางวัน (40) · ขนาดการใช้ไฟ (25) · "
+               "ความสม่ำเสมอของโหลดกลางวัน (20) · ใช้ไฟทุกวัน/เฉพาะวันธรรมดา (10) · "
+               "แนวโน้มการใช้ไฟโต (5) — เกรด A คือใช้ไฟกลางวันเยอะ สม่ำเสมอ ปริมาณมาก "
+               "ซึ่งโซลาร์จะคุ้มที่สุด")
+card_close()
+
+# ---------------------------------------------------------------------------
 # export one-pager
 # ---------------------------------------------------------------------------
 card_open("บันทึกสรุปส่งลูกค้า / นำเสนอหัวหน้า", "neo-cream")
 st.write("ดาวน์โหลดไฟล์สรุปหน้าเดียว เปิดในเบราว์เซอร์แล้วกด Ctrl+P เพื่อบันทึกเป็น PDF "
          "หรือแคปหน้าจอส่งได้เลย")
+# รวบรวมข้อมูลพฤติกรรม (เดือนมากสุด/น้อยสุด + ขนาดโซลาร์ที่เหมาะ) สำหรับหน้าสรุป (ข้อ4)
+usage_profile = None
+if have_interval:
+    try:
+        _mt = monthly_total_kwh(bill["data"])
+        _mt_full = _mt[_mt["n_days"] >= 20] if len(_mt) else _mt
+        _src = _mt_full if len(_mt_full) >= 2 else _mt
+        up = {"target_kwp": (rec.get("target_wp") or 0) / 1000.0 or None, "sizes": []}
+        if len(_src):
+            _hi = _src.loc[_src["total_kwh"].idxmax()]
+            _lo = _src.loc[_src["total_kwh"].idxmin()]
+            up.update(hi_label=_hi["month_label"], hi_kwh=_hi["total_kwh"],
+                      lo_label=_lo["month_label"], lo_kwh=_lo["total_kwh"])
+        _sz = pick_three_solar_sizes(catalog, rec.get("target_wp") or 0, want_battery=_has_batt)
+        _names = {"min": "ขั้นต่ำ", "mid": "กลาง", "near": "ใกล้โหลดจริง"}
+        up["sizes"] = [(_names[k], _sz[k]["kwp"]) for k in ("min", "mid", "near") if k in _sz]
+        usage_profile = up
+    except Exception:
+        usage_profile = None
+
 html = _build_onepager_html(meta, avg_kwh, avg_cost, fin_rows, cust[show_cols],
-                            has_batt=_has_batt, saving_source=saving_source)
+                            has_batt=_has_batt, saving_source=saving_source,
+                            usage_profile=usage_profile, quant=quant_ctx)
 st.download_button("ดาวน์โหลดสรุปหน้าเดียว (HTML)", data=html,
                    file_name="สรุปเสนอลูกค้า.html", mime="text/html")
 with st.expander("ดูตัวอย่างก่อนบันทึก"):
